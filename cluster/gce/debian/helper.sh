@@ -36,7 +36,6 @@ KUBERNETES_MASTER_NAME: $(yaml-quote ${MASTER_NAME})
 ALLOCATE_NODE_CIDRS: $(yaml-quote ${ALLOCATE_NODE_CIDRS:-false})
 ENABLE_CLUSTER_MONITORING: $(yaml-quote ${ENABLE_CLUSTER_MONITORING:-none})
 ENABLE_CLUSTER_LOGGING: $(yaml-quote ${ENABLE_CLUSTER_LOGGING:-false})
-ENABLE_CLUSTER_UI: $(yaml-quote ${ENABLE_CLUSTER_UI:-false})
 ENABLE_NODE_LOGGING: $(yaml-quote ${ENABLE_NODE_LOGGING:-false})
 LOGGING_DESTINATION: $(yaml-quote ${LOGGING_DESTINATION:-})
 ELASTICSEARCH_LOGGING_REPLICAS: $(yaml-quote ${ELASTICSEARCH_LOGGING_REPLICAS:-})
@@ -70,26 +69,6 @@ KUBECFG_CERT: $(yaml-quote ${KUBECFG_CERT_BASE64:-})
 KUBECFG_KEY: $(yaml-quote ${KUBECFG_KEY_BASE64:-})
 KUBELET_APISERVER: $(yaml-quote ${KUBELET_APISERVER:-})
 EOF
-    if [ -n "${APISERVER_TEST_ARGS:-}" ]; then
-      cat >>$file <<EOF
-APISERVER_TEST_ARGS: $(yaml-quote ${APISERVER_TEST_ARGS})
-EOF
-    fi
-    if [ -n "${KUBELET_TEST_ARGS:-}" ]; then
-      cat >>$file <<EOF
-KUBELET_TEST_ARGS: $(yaml-quote ${KUBELET_TEST_ARGS})
-EOF
-    fi
-    if [ -n "${CONTROLLER_MANAGER_TEST_ARGS:-}" ]; then
-      cat >>$file <<EOF
-CONTROLLER_MANAGER_TEST_ARGS: $(yaml-quote ${CONTROLLER_MANAGER_TEST_ARGS})
-EOF
-    fi
-    if [ -n "${SCHEDULER_TEST_ARGS:-}" ]; then
-      cat >>$file <<EOF
-SCHEDULER_TEST_ARGS: $(yaml-quote ${SCHEDULER_TEST_ARGS})
-EOF
-    fi
   else
     # Node-only env vars.
     cat >>$file <<EOF
@@ -97,16 +76,6 @@ KUBERNETES_MASTER: "false"
 ZONE: $(yaml-quote ${ZONE})
 EXTRA_DOCKER_OPTS: $(yaml-quote ${EXTRA_DOCKER_OPTS:-})
 EOF
-    if [ -n "${KUBELET_TEST_ARGS:-}" ]; then
-      cat >>$file <<EOF
-KUBELET_TEST_ARGS: $(yaml-quote ${KUBELET_TEST_ARGS})
-EOF
-    fi
-    if [ -n "${KUBEPROXY_TEST_ARGS:-}" ]; then
-      cat >>$file <<EOF
-KUBEPROXY_TEST_ARGS: $(yaml-quote ${KUBEPROXY_TEST_ARGS})
-EOF
-    fi
   fi
 }
 
@@ -152,7 +121,7 @@ function create-node-instance-template {
   if [[ -n ${1:-} ]]; then
     suffix="-${1}"
   fi
-  create-node-template "${NODE_INSTANCE_PREFIX}-template${suffix}" "${scope_flags}" \
+  create-node-template "${NODE_INSTANCE_PREFIX}-template${suffix}" "${scope_flags[*]}" \
     "startup-script=${KUBE_ROOT}/cluster/gce/configure-vm.sh" \
     "kube-env=${KUBE_TEMP}/node-kube-env.yaml"
 }

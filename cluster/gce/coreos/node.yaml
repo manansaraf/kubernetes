@@ -91,13 +91,11 @@ coreos:
         [Service]
         Type=oneshot
         EnvironmentFile=/etc/kube-env
-        ExecStartPre=/usr/bin/rm -rf /opt/rkt
         ExecStartPre=/usr/bin/mkdir -p /opt/rkt
         ExecStartPre=/usr/bin/wget \
         -O /opt/rkt/rkt-v${RKT_VERSION}.tar.gz \
         https://github.com/coreos/rkt/releases/download/v${RKT_VERSION}/rkt-v${RKT_VERSION}.tar.gz
-        ExecStartPre=/usr/bin/tar xzvf /opt/rkt/rkt-v${RKT_VERSION}.tar.gz -C /opt --overwrite
-        ExecStart=/usr/bin/mv /opt/rkt-v${RKT_VERSION} /opt/rkt/rkt
+        ExecStart=/usr/bin/tar xzvf /opt/rkt/rkt-v${RKT_VERSION}.tar.gz -C /opt --overwrite
 
     - name: kubernetes-install-minion.service
       command: start
@@ -144,15 +142,14 @@ coreos:
         ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
         ExecStartPre=/run/setup-auth.sh
         ExecStart=/opt/kubernetes/server/bin/kubelet \
-        --api-servers=https://${KUBERNETES_MASTER_NAME}.c.${PROJECT_ID}.internal \
+        --api_servers=https://${KUBERNETES_MASTER_NAME}.c.${PROJECT_ID}.internal \
         --config=/etc/kubernetes/manifests \
-        --allow-privileged=False \
+        --allow_privileged=False \
         --v=2 \
-        --cluster-dns=10.0.0.10 \
-        --cluster-domain=cluster.local \
+        --cluster_dns=10.0.0.10 \
+        --cluster_domain=cluster.local \
         --logtostderr=true \
-        --container-runtime=${KUBERNETES_CONTAINER_RUNTIME} \
-        --rkt-path=/opt/rkt/rkt/rkt
+        --container-runtime=${KUBERNETES_CONTAINER_RUNTIME}
         Restart=always
         RestartSec=10
 
@@ -203,4 +200,4 @@ coreos:
         After=kubernetes-install-rkt.service
         [Service]
         EnvironmentFile=/etc/kube-env
-        ExecStart=/opt/rkt/rkt/rkt metadata-service
+        ExecStart=/opt/rkt-v${RKT_VERSION}/rkt metadata-service

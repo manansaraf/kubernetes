@@ -22,13 +22,13 @@ KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
 source "${KUBE_ROOT}/cluster/gce/${KUBE_CONFIG_FILE-"config-default.sh"}"
 source "${KUBE_ROOT}/cluster/common.sh"
 
-if [[ "${OS_DISTRIBUTION}" == "debian" || "${OS_DISTRIBUTION}" == "coreos" || "${OS_DISTRIBUTION}" == "trusty" ]]; then
+if [[ "${OS_DISTRIBUTION}" == "debian" || "${OS_DISTRIBUTION}" == "coreos" ]]; then
   source "${KUBE_ROOT}/cluster/gce/${OS_DISTRIBUTION}/helper.sh"
 else
   echo "Cannot operate on cluster using os distro: ${OS_DISTRIBUTION}" >&2
   exit 1
 fi
-
+export COUNTER=0
 NODE_INSTANCE_PREFIX="${INSTANCE_PREFIX}-minion"
 
 ALLOCATE_NODE_CIDRS=true
@@ -247,9 +247,13 @@ function upload-server-tars() {
 #   MINION_NAMES
 function detect-minion-names {
   detect-project
-  MINION_NAMES=($(gcloud compute instance-groups managed list-instances \
-    "${NODE_INSTANCE_PREFIX}-group" --zone "${ZONE}" --project "${PROJECT}" \
-    | cut -d'/' -f11))
+  MINION_NAMES=()
+  for ((i=0; i<$COUNTER; i++)); do
+    MINION_TEMP_NAMES=($(gcloud preview --project "${PROJECT}" instance-groups \
+      --zone "${ZONE}" instances --group "${NODE_INSTANCE_PREFIX}-group${i}" list \
+      | cut -d'/' -f11))
+    MINION_NAMES=("${MINION_NAMES[*]-}" "${MINION_TEMP_NAMES[*]-}")
+  done
   echo "MINION_NAMES=${MINION_NAMES[*]}" >&2
 }
 
@@ -398,10 +402,6 @@ function create-node-template {
   fi
 
   local attempt=1
-  local preemptible_minions=""
-  if [[ "${PREEMPTIBLE_MINION}" == "true" ]]; then
-    preemptible_minions="--preemptible --maintenance-policy TERMINATE"
-  fi
   while true; do
     echo "Attempt ${attempt} to create ${1}" >&2
     if ! gcloud compute instance-templates create "$1" \
@@ -413,7 +413,6 @@ function create-node-template {
       --image "${MINION_IMAGE}" \
       --tags "${MINION_TAG}" \
       --network "${NETWORK}" \
-      ${preemptible_minions} \
       $2 \
       --can-ip-forward \
       --metadata-from-file "$3","$4" >&2; then
@@ -430,7 +429,7 @@ function create-node-template {
 }
 
 # Robustly try to add metadata on an instance.
-# $1: The name of the instance.
+# $1: The name of the instace.
 # $2...$n: The metadata key=value pairs to add.
 function add-instance-metadata {
   local -r instance=$1
@@ -536,9 +535,9 @@ function write-node-env {
 function create-certs {
   local -r cert_ip="${1}"
 
-  local octets=($(echo "$SERVICE_CLUSTER_IP_RANGE" | sed -e 's|/.*||' -e 's/\./ /g'))
-  ((octets[3]+=1))
-  local -r service_ip=$(echo "${octets[*]}" | sed 's/ /./g')
+  local octects=($(echo "$SERVICE_CLUSTER_IP_RANGE" | sed -e 's|/.*||' -e 's/\./ /g'))
+  ((octects[3]+=1))
+  local -r service_ip=$(echo "${octects[*]}" | sed 's/ /./g')
   local -r sans="IP:${cert_ip},IP:${service_ip},DNS:kubernetes,DNS:kubernetes.default,DNS:kubernetes.default.svc,DNS:kubernetes.default.svc.${DNS_DOMAIN},DNS:${MASTER_NAME}"
 
   # Note: This was heavily cribbed from make-ca-cert.sh
@@ -568,6 +567,22 @@ function create-certs {
   KUBECFG_KEY_BASE64=$(cat "${CERT_DIR}/pki/private/kubecfg.key" | base64 | tr -d '\r\n')
 }
 
+function threaded-create-nodes {
+  local GROUP_COUNT=$1
+  local NUM_MINION_IN_GROUP=$2
+  gcloud compute instance-groups managed \
+        create "${NODE_INSTANCE_PREFIX}-group${GROUP_COUNT}" \
+        --project "${PROJECT}" \
+        --zone "${ZONE}" \
+        --base-instance-name "${NODE_INSTANCE_PREFIX}" \
+        --size "${NUM_MINION_IN_GROUP}" \
+        --template "${NODE_INSTANCE_PREFIX}-template" || true;
+  gcloud compute instance-groups managed wait-until-stable \
+        "${NODE_INSTANCE_PREFIX}-group${GROUP_COUNT}" \
+        --zone "${ZONE}" \
+        --project "${PROJECT}" || true;
+}
+
 # Instantiate a kubernetes cluster
 #
 # Assumed vars
@@ -583,7 +598,6 @@ function kube-up {
   # Make sure we have the tar files staged on Google Storage
   find-release-tars
   upload-server-tars
-
   local running_in_terminal=false
   # May be false if tty is not allocated (for example with ssh -T).
   if [ -t 1 ]; then
@@ -646,7 +660,7 @@ function kube-up {
   # Generate a bearer token for this cluster. We push this separately
   # from the other cluster variables so that the client (this
   # computer) can forget it later. This should disappear with
-  # http://issue.k8s.io/3168
+  # https://github.com/GoogleCloudPlatform/kubernetes/issues/3168
   KUBELET_TOKEN=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | base64 | tr -d "=+/" | dd bs=32 count=1 2>/dev/null)
   KUBE_PROXY_TOKEN=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | base64 | tr -d "=+/" | dd bs=32 count=1 2>/dev/null)
 
@@ -664,7 +678,7 @@ function kube-up {
   create-master-instance "${MASTER_RESERVED_IP}" &
 
   # Create a single firewall rule for all minions.
-  create-firewall-rule "${MINION_TAG}-all" "${CLUSTER_IP_RANGE}" "${MINION_TAG}" &
+  #create-firewall-rule "${MINION_TAG}-all" "${CLUSTER_IP_RANGE}" "${MINION_TAG}" &
 
   # Report logging choice (if any).
   if [[ "${ENABLE_NODE_LOGGING-}" == "true" ]]; then
@@ -677,41 +691,38 @@ function kube-up {
   echo "Creating minions."
 
   # TODO(mbforbes): Refactor setting scope flags.
-  local scope_flags=
-  if [ -n "${MINION_SCOPES}" ]; then
-    scope_flags="--scopes ${MINION_SCOPES}"
+  local -a scope_flags=()
+  if (( "${#MINION_SCOPES[@]}" > 0 )); then
+    scope_flags=("--scopes" "$(join_csv ${MINION_SCOPES[@]})")
   else
-    scope_flags="--no-scopes"
+    scope_flags=("--no-scopes")
   fi
 
   write-node-env
-  create-node-instance-template
-
-  gcloud compute instance-groups managed \
-      create "${NODE_INSTANCE_PREFIX}-group" \
-      --project "${PROJECT}" \
-      --zone "${ZONE}" \
-      --base-instance-name "${NODE_INSTANCE_PREFIX}" \
-      --size "${NUM_MINIONS}" \
-      --template "${NODE_INSTANCE_PREFIX}-template" || true;
-  gcloud compute instance-groups managed wait-until-stable \
-      "${NODE_INSTANCE_PREFIX}-group" \
-			--zone "${ZONE}" \
-			--project "${PROJECT}" || true;
+  #create-node-instance-template
+  local ROLLOVER=$NUM_MINIONS_PER_THREAD
+  local NUM_MINION_TEMP=0
+  local NUM_MINION_LEFT=${NUM_MINIONS}
+  local PID_ARRAY=()
+  while [ $NUM_MINION_LEFT -gt 0 ]; do
+    if [ $NUM_MINION_LEFT -gt $ROLLOVER ]; then
+      NUM_MINION_TEMP=${ROLLOVER}
+      let NUM_MINION_LEFT=NUM_MINION_LEFT-ROLLOVER
+    else  
+      NUM_MINION_TEMP=${NUM_MINION_LEFT}
+      NUM_MINION_LEFT=0
+    fi
+    threaded-create-nodes $COUNTER $NUM_MINION_TEMP &
+    PID=$!
+    PID_ARRAY+=($PID)
+    let COUNTER=COUNTER+1
+  done
+  echo "Waiting for all instance groups to be stable"
+  for ((i=0; i<$COUNTER; i++)); do
+    wait ${PID_ARRAY[$i]}
+  done
   detect-minion-names
   detect-master
-
-  # Create autoscaler for nodes if requested
-  if [[ "${ENABLE_NODE_AUTOSCALER}" == "true" ]]; then
-    METRICS=""
-    METRICS+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/cpu/node_utilization,"
-    METRICS+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
-    METRICS+="--custom-metric-utilization metric=custom.cloudmonitoring.googleapis.com/kubernetes.io/memory/node_utilization,"
-    METRICS+="utilization-target=${TARGET_NODE_UTILIZATION},utilization-target-type=GAUGE "
-    echo "Creating node autoscaler."
-    gcloud compute instance-groups managed set-autoscaling "${NODE_INSTANCE_PREFIX}-group" --zone "${ZONE}" --project $"{PROJECT}" \
-        --min-num-replicas "${AUTOSCALER_MIN_NODES}" --max-num-replicas "${AUTOSCALER_MAX_NODES}" ${METRICS} || true
-  fi
 
   echo "Waiting for cluster initialization."
   echo
@@ -758,43 +769,13 @@ function kube-up {
   echo
 
 }
-
-# Delete a kubernetes cluster. This is called from test-teardown.
-#
-# Assumed vars:
-#   MASTER_NAME
-#   NODE_INSTANCE_PREFIX
-#   ZONE
-# This function tears down cluster resources 10 at a time to avoid issuing too many
-# API calls and exceeding API quota. It is important to bring down the instances before bringing
-# down the firewall rules and routes.
-function kube-down {
-  detect-project
-
-  echo "Bringing down cluster"
-  set +e  # Do not stop on error
-
-  # Delete autoscaler for nodes if present.
-  local autoscaler
-  autoscaler=( $(gcloud compute instance-groups managed list --zone "${ZONE}" --project "${PROJECT}" \
-                 | grep "${NODE_INSTANCE_PREFIX}-group" \
-                 | awk '{print $7}') )
-  if [[ "${autoscaler:-}" == "yes" ]]; then
-    gcloud compute instance-groups managed stop-autoscaling "${NODE_INSTANCE_PREFIX}-group" --zone "${ZONE}" --project "${PROJECT}"
-  fi
-
-  # Get the name of the managed instance group template before we delete the
-  # managed instange group. (The name of the managed instnace group template may
-  # change during a cluster upgrade.)
-  local template=$(get-template "${PROJECT}" "${ZONE}" "${NODE_INSTANCE_PREFIX}-group")
-
-  # The gcloud APIs don't return machine parseable error codes/retry information. Therefore the best we can
-  # do is parse the output and special case particular responses we are interested in.
-  if gcloud compute instance-groups managed describe "${NODE_INSTANCE_PREFIX}-group" --project "${PROJECT}" --zone "${ZONE}" &>/dev/null; then
+function threaded-kill-nodes {
+  GROUP_ID=$1
+  if gcloud compute instance-groups managed describe --project "${PROJECT}" --zone "${ZONE}" "${NODE_INSTANCE_PREFIX}-group${GROUP_ID}" &>/dev/null; then
     deleteCmdOutput=$(gcloud compute instance-groups managed delete --zone "${ZONE}" \
       --project "${PROJECT}" \
       --quiet \
-      "${NODE_INSTANCE_PREFIX}-group")
+      "${NODE_INSTANCE_PREFIX}-group${GROUP_ID}")
     if [[ "$deleteCmdOutput" != ""  ]]; then
       # Managed instance group deletion is done asynchronously, we must wait for it to complete, or subsequent steps fail
       deleteCmdOperationId=$(echo $deleteCmdOutput | grep "Operation:" | sed "s/.*Operation:[[:space:]]*\([^[:space:]]*\).*/\1/g")
@@ -810,7 +791,51 @@ function kube-down {
       fi
     fi
   fi
+}
+# Delete a kubernetes cluster. This is called from test-teardown.
+#
+# Assumed vars:
+#   MASTER_NAME
+#   NODE_INSTANCE_PREFIX
+#   ZONE
+# This function tears down cluster resources 10 at a time to avoid issuing too many
+# API calls and exceeding API quota. It is important to bring down the instances before bringing
+# down the firewall rules and routes.
+function kube-down {
+  detect-project
 
+  echo "Bringing down cluster"
+  set +e  # Do not stop on error
+  # Get the name of the managed instance group template before we delete the
+  # managed instange group. (The name of the managed instnace group template may
+  # change during a cluster upgrade.)
+  local template=$(get-template "${PROJECT}" "${ZONE}" "${NODE_INSTANCE_PREFIX}-group0")
+
+  # The gcloud APIs don't return machine parseable error codes/retry information. Therefore the best we can
+  # do is parse the output and special case particular responses we are interested in.
+  
+  local ROLLOVER=$NUM_MINIONS_PER_THREAD
+  local NUM_MINION_TEMP=0
+  local NUM_MINION_LEFT=${NUM_MINIONS}
+  local PID_ARRAY_DELETE=()
+  local COUNT=0
+  while [ $NUM_MINION_LEFT -gt 0 ]; do
+    if [ $NUM_MINION_LEFT -gt $ROLLOVER ]; then
+      NUM_MINION_TEMP=${ROLLOVER}
+      let NUM_MINION_LEFT=NUM_MINION_LEFT-ROLLOVER
+    else  
+      NUM_MINION_TEMP=${NUM_MINION_LEFT}
+      NUM_MINION_LEFT=0
+    fi
+    threaded-kill-nodes $COUNT &
+    PID_DELETE=$!
+    PID_ARRAY_DELETE+=($PID_DELETE)
+    let COUNT=COUNT+1
+  done
+  echo ${#PID_ARRAY_DELETE[@]}
+  for ((i=0; i<${#PID_ARRAY_DELETE[@]}; i++)); do
+    wait ${PID_ARRAY_DELETE[$i]}
+  done 
   if gcloud compute instance-templates describe --project "${PROJECT}" "${template}" &>/dev/null; then
     gcloud compute instance-templates delete \
       --project "${PROJECT}" \
@@ -903,6 +928,7 @@ function kube-down {
   export CONTEXT="${PROJECT}_${INSTANCE_PREFIX}"
   clear-kubeconfig
   set -e
+  COUNTER=0
 }
 
 # Gets the instance template for the managed instance group with the provided
@@ -935,8 +961,8 @@ function check-resources {
   echo "Looking for already existing resources"
   KUBE_RESOURCE_FOUND=""
 
-  if gcloud compute instance-groups managed describe --project "${PROJECT}" --zone "${ZONE}" "${NODE_INSTANCE_PREFIX}-group" &>/dev/null; then
-    KUBE_RESOURCE_FOUND="Managed instance group ${NODE_INSTANCE_PREFIX}-group"
+  if gcloud compute instance-groups managed describe --project "${PROJECT}" --zone "${ZONE}" "${NODE_INSTANCE_PREFIX}-group0" &>/dev/null; then
+    KUBE_RESOURCE_FOUND="Managed instance group ${NODE_INSTANCE_PREFIX}-group0"
     return 1
   fi
 
@@ -1021,40 +1047,43 @@ function prepare-push() {
     write-node-env
 
     # TODO(mbforbes): Refactor setting scope flags.
-    local scope_flags=
-    if [ -n "${MINION_SCOPES}" ]; then
-      scope_flags="--scopes ${MINION_SCOPES}"
+    local -a scope_flags=()
+    if (( "${#MINION_SCOPES[@]}" > 0 )); then
+      scope_flags=("--scopes" "${MINION_SCOPES[@]}")
     else
-      scope_flags="--no-scopes"
+      scope_flags=("--no-scopes")
     fi
 
     # Ugly hack: Since it is not possible to delete instance-template that is currently
     # being used, create a temp one, then delete the old one and recreate it once again.
     create-node-instance-template "tmp"
+    local TEMP_COUNTER=${COUNTER}
+    local COUNT=0
+    while [ $TEMP_COUNTER -gt 0 ]; do
+      gcloud compute instance-groups managed --zone "${ZONE}" \
+        set-template "${NODE_INSTANCE_PREFIX}-group${COUNT}" \
+        --project "${PROJECT}" \
+        --template "${NODE_INSTANCE_PREFIX}-template-tmp" || true;
 
-    gcloud compute instance-groups managed \
-      set-instance-template "${NODE_INSTANCE_PREFIX}-group" \
-      --template "${NODE_INSTANCE_PREFIX}-template-tmp" \
-      --zone "${ZONE}" \
-      --project "${PROJECT}" || true;
+      gcloud compute instance-templates delete \
+        --project "${PROJECT}" \
+        --quiet \
+        "${NODE_INSTANCE_PREFIX}-template" || true
 
-    gcloud compute instance-templates delete \
-      --project "${PROJECT}" \
-      --quiet \
-      "${NODE_INSTANCE_PREFIX}-template" || true
+      create-node-instance-template
 
-    create-node-instance-template
+      gcloud compute instance-groups managed --zone "${ZONE}" \
+        set-template "${NODE_INSTANCE_PREFIX}-group${COUNT}" \
+        --project "${PROJECT}" \
+        --template "${NODE_INSTANCE_PREFIX}-template" || true;
 
-    gcloud compute instance-groups managed \
-      set-instance-template "${NODE_INSTANCE_PREFIX}-group" \
-      --template "${NODE_INSTANCE_PREFIX}-template" \
-      --zone "${ZONE}" \
-      --project "${PROJECT}" || true;
-
-    gcloud compute instance-templates delete \
-      --project "${PROJECT}" \
-      --quiet \
-      "${NODE_INSTANCE_PREFIX}-template-tmp" || true
+      gcloud compute instance-templates delete \
+        --project "${PROJECT}" \
+        --quiet \
+        "${NODE_INSTANCE_PREFIX}-template-tmp" || true
+      let COUNT=COUNT+1
+      let TEMP_COUNTER=TEMP_COUNTER-1
+    done
   fi
 }
 
@@ -1095,7 +1124,7 @@ function kube-push {
   # is solved (because that's blocking automatic dynamic nodes from
   # working). The node-kube-env has to be composed with the KUBELET_TOKEN
   # and KUBE_PROXY_TOKEN.  Ideally we would have
-  # http://issue.k8s.io/3168
+  # https://github.com/GoogleCloudPlatform/kubernetes/issues/3168
   # implemented before then, though, so avoiding this mess until then.
 
   echo
@@ -1196,11 +1225,7 @@ function ssh-to-node {
 
 # Restart the kube-proxy on a node ($1)
 function restart-kube-proxy {
-  if [[ "${OS_DISTRIBUTION}" == "trusty" ]]; then
-    ssh-to-node "$1" "sudo initctl restart kube-proxy"
-  else
-    ssh-to-node "$1" "sudo /etc/init.d/kube-proxy restart"
-  fi
+  ssh-to-node "$1" "sudo /etc/init.d/kube-proxy restart"
 }
 
 # Restart the kube-apiserver on a node ($1)
